@@ -68,6 +68,151 @@ args = parser.parse_args()
 enable_logging(log_file_path=args.log_file_path)
 
 
+def _isin_via_searchsorted(
+    x: torch.Tensor, values_sorted_unique: torch.Tensor
+) -> torch.Tensor:
+    """
+    GPU-friendly membership test:
+    values_sorted_unique must be sorted & unique.
+    Returns mask same shape as x.
+    """
+    idx = torch.searchsorted(values_sorted_unique, x)
+    idx = idx.clamp_max(values_sorted_unique.numel() - 1)
+    return values_sorted_unique[idx] == x
+
+
+def build_csr_for_nodes(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    nodes_sorted_unique: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build CSR adjacency for *rows = nodes_sorted_unique*.
+    Returns (row_ptr, col) where:
+      row_ptr: (R+1,)
+      col: (nnz,)
+    Rows are in the same order as nodes_sorted_unique.
+    """
+    # Map src node ids -> row ids in [0, R)
+    row = torch.searchsorted(nodes_sorted_unique, src)
+    # src is guaranteed in nodes_sorted_unique for kept edges
+    # Sort edges by row to build CSR
+    perm = torch.argsort(row)
+    row = row[perm]
+    col = dst[perm]
+
+    R = nodes_sorted_unique.numel()
+    counts = torch.bincount(row, minlength=R)
+    row_ptr = torch.empty(R + 1, device=src.device, dtype=torch.long)
+    row_ptr[0] = 0
+    row_ptr[1:] = torch.cumsum(counts, dim=0)
+    return row_ptr, col
+
+
+from dataclasses import replace
+
+import torch
+from torch_scatter import scatter_mean
+
+
+def _isin_sorted_unique(x: torch.Tensor, su: torch.Tensor) -> torch.Tensor:
+    """
+    x: (...,)
+    su: (R,) sorted unique
+    returns: mask (...,) where mask[i]=True iff x[i] in su
+    """
+    idx = torch.searchsorted(su, x)
+    # clamp to valid range (handles idx==R)
+    idx = idx.clamp_max(su.numel() - 1)
+    return su[idx] == x
+
+
+class TimeGapSeedNbrAggHook(StatelessHook):
+    """
+    Produces a scatter-friendly representation of time-gap "neighbors of seed nodes"
+    without building Python lists or CSR.
+
+    Outputs attached to batch:
+      - batch.time_gap_seed_nodes      : (B,) seed nodes in original order (with duplicates)
+      - batch.time_gap_seed_su         : (R,) sorted unique seed nodes
+      - batch.time_gap_row_occ         : (B,) maps each seed occurrence -> unique seed row id in [0..R-1]
+      - batch.time_gap_row             : (nnz2,) row ids for scatter (unique seed row per edge endpoint)
+      - batch.time_gap_col             : (nnz2,) neighbor node ids corresponding to row entries
+    """
+
+    requires = {'neg'}
+    produces = {'time_gap_nbrs'}
+
+    def __init__(self, time_gap: int):
+        self._time_gap = int(time_gap)
+
+    def __call__(self, dg: 'DGraph', batch: 'DGBatch') -> 'DGBatch':
+        device = dg.device
+
+        # 1) Build time-gap slice
+        time_gap_slice = replace(dg._slice)
+        time_gap_slice.start_idx = max(dg._slice.end_idx - self._time_gap, 0)
+        time_gap_slice.end_time = int(batch.edge_time.min()) - 1
+
+        # Get edges in that window (src, dst are assumed 1D tensors)
+        src, dst, _ = dg._storage.get_edges(time_gap_slice)
+        src = src.to(device, non_blocking=True)
+        dst = dst.to(device, non_blocking=True)
+
+        # 2) Seeds (order preserved, duplicates preserved)
+        seed_nodes = torch.cat(
+            [batch.edge_src, batch.edge_dst, batch.neg.to(device)], dim=0
+        )  # (B,)
+
+        # Unique seeds (sorted for searchsorted)
+        seed_su = torch.sort(torch.unique(seed_nodes)).values  # (R,)
+
+        # 3) Ensure every element of src2 is in seeds by construction:
+        #    - if src is seed, keep directed edge (src -> dst)
+        #    - if dst is seed, keep directed edge (dst -> src)
+        src_mask = _isin_sorted_unique(src, seed_su)
+        dst_mask = _isin_sorted_unique(dst, seed_su)
+
+        src2 = torch.cat([src[src_mask], dst[dst_mask]], dim=0)
+        dst2 = torch.cat([dst[src_mask], src[dst_mask]], dim=0)
+
+        # 4) Map src2 (seed endpoint) to [0..R-1] for scatter
+        row = torch.searchsorted(seed_su, src2)  # (nnz2,)
+
+        # 5) Map each seed occurrence to [0..R-1] to preserve duplicates + order later
+        row_occ = torch.searchsorted(seed_su, seed_nodes)  # (B,)
+
+        batch.time_gap_nbrs = (
+            seed_nodes,
+            seed_su,
+            row,
+            row_occ,
+            dst2,
+        )
+        return batch
+
+
+def compute_time_gap_mean_features(
+    node_feat: torch.Tensor, batch: 'DGBatch'
+) -> torch.Tensor:
+    """
+    Returns:
+      time_gap_feat: (B, D) features aligned to batch.time_gap_seed_nodes (original order, duplicates preserved)
+
+    Definition:
+      For each seed occurrence i (in original seed_nodes order),
+      time_gap_feat[i] = mean_{nbr in time-gap neighbors of that seed node} node_feat[nbr]
+
+    If a seed has zero time-gap neighbors, its mean row will be zero.
+    """
+    seed_nodes, seed_su, row, row_occ, col = batch.time_gap_nbrs
+    num_rows = seed_su.numel()
+    mean_u = scatter_mean(
+        node_feat[col], row, dim=0, dim_size=num_rows
+    )  # (num_rows, D)
+    return mean_u[row_occ]  # (B, D)
+
+
 class GraphMixerEncoder(nn.Module):
     def __init__(
         self,
@@ -121,12 +266,7 @@ class GraphMixerEncoder(nn.Module):
             min=1
         )
 
-        # Node Encoder
-        num_nodes, feat_dim = len(batch.time_gap_nbrs), node_feat.shape[1]
-        time_gap_feat = torch.zeros((num_nodes, feat_dim), device=node_feat.device)
-        for i in range(num_nodes):
-            if batch.time_gap_nbrs[i]:
-                time_gap_feat[i] = node_feat[batch.time_gap_nbrs[i]].mean(dim=0)
+        time_gap_feat = compute_time_gap_mean_features(node_feat, batch)
 
         z_node = (
             time_gap_feat
@@ -219,44 +359,11 @@ train_dg = DGraph(train_data, device=args.device)
 val_dg = DGraph(val_data, device=args.device)
 test_dg = DGraph(test_data, device=args.device)
 
-
-class GraphMixerHook(StatelessHook):
-    r"""Custom hook that gets 1-hop neighbors in a specific window.
-
-    If N(v_i, t_s, t_e) = nbrs of v_i from [t_s, t_e], then we materialize
-    N(node_ids, t - TIME_GAP, t) for all seed nodes in a given batch.
-    """
-
-    requires = {'neg'}
-    produces = {'time_gap_nbrs'}
-
-    def __init__(self, time_gap: int) -> None:
-        self._time_gap = time_gap
-
-    def __call__(self, dg: DGraph, batch: DGBatch) -> DGBatch:
-        # Construct a the time_gap slice
-        time_gap_slice = replace(dg._slice)
-        time_gap_slice.start_idx = max(dg._slice.end_idx - self._time_gap, 0)
-        time_gap_slice.end_time = int(batch.edge_time.min()) - 1
-        time_gap_src, time_gap_dst, _ = dg._storage.get_edges(time_gap_slice)
-
-        nbr_index = defaultdict(list)
-        for u, v in zip(time_gap_src.tolist(), time_gap_dst.tolist()):
-            nbr_index[u].append(v)
-            nbr_index[v].append(u)  # undirected
-
-        seed_nodes = torch.cat(
-            [batch.edge_src, batch.edge_dst, batch.neg.to(dg.device)]
-        )
-        batch.time_gap_nbrs = [nbr_index.get(nid, []) for nid in seed_nodes.tolist()]  # type: ignore
-        return batch
-
-
 hm = RecipeRegistry.build(
     RECIPE_TGB_LINK_PRED, dataset_name=args.dataset, train_dg=train_dg
 )
 train_key, val_key, test_key = hm.keys
-hm.register_shared(GraphMixerHook(args.time_gap))
+hm.register_shared(TimeGapSeedNbrAggHook(args.time_gap))
 hm.register_shared(
     RecencyNeighborHook(
         num_nbrs=[args.n_nbrs],

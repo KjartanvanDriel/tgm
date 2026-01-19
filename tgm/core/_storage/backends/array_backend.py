@@ -67,6 +67,30 @@ class DGStorageArrayBackend(DGStorageBase):
             logger.debug('No edge events in slice: %s', slice)
         return src, dst, time
 
+    def get_edges_slice(self, slice: DGSliceTracker) -> Tuple[Tensor, Tensor, Tensor]:
+        """Optimized get_edges using binary search on sorted edge_mask.
+
+        Since edge_mask is sorted after DGData initialization, we can use
+        binary search to find the slice boundaries directly, avoiding the
+        O(num_edges) boolean mask comparison.
+        """
+        lb_idx, ub_idx = self._binary_search(slice)
+
+        # Binary search on the sorted edge_mask to find slice boundaries
+        left = int(torch.searchsorted(self._data.edge_mask, lb_idx))
+        right = int(torch.searchsorted(self._data.edge_mask, ub_idx))
+
+        # Direct slice indexing instead of boolean mask
+        edges = self._data.edge_index[left:right]
+        src, dst = edges[:, 0], edges[:, 1]
+        time = self._data.time[self._data.edge_mask[left:right]]
+
+        src, dst, time = src.contiguous(), dst.contiguous(), time.contiguous()
+
+        if not edges.numel():
+            logger.debug('No edge events in slice: %s', slice)
+        return src, dst, time
+
     def get_node_events(self, slice: DGSliceTracker) -> Tuple[Tensor, Tensor]:
         if self._data.node_x_mask is None:
             return torch.empty(0, dtype=torch.int), torch.empty(0, dtype=torch.long)
