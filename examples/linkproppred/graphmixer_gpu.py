@@ -181,7 +181,11 @@ def compute_time_gap_mean_features(
 
     mean_u = torch.zeros(num_rows, D, device=node_feat.device, dtype=node_feat.dtype)
     mean_u.scatter_reduce_(
-        0, row.unsqueeze(1).expand(-1, D), node_feat[col], reduce='mean'
+        0,
+        row.unsqueeze(1).expand(-1, D),
+        node_feat[col],
+        reduce='mean',
+        include_self=False,
     )
 
     return mean_u[row_occ]  # (B, D)
